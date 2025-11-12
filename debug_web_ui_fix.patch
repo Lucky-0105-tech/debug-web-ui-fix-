@@ -1,0 +1,285 @@
+diff --git a/app.py b/app.py
+index 40e60db..b80c1c5 100644
+--- a/app.py
++++ b/app.py
+@@ -1,9 +1,20 @@
++# MODIFICATIONS FROM ORIGINAL app.py:
++# 1. Added eventlet monkey patch for async support
++# 2. Changed import to use fixed MQTT listener
++# 3. Set async_mode to 'eventlet'
++# 4. Improved error handling and logging
++
++# FIXED: Add eventlet monkey patch for async support
++import eventlet
++eventlet.monkey_patch()
++
+ from flask import Flask, request, render_template, send_from_directory
+ from flask_socketio import SocketIO, emit
+ from flask_cors import CORS
+ from formlabs.platform import init_logging
+ from formlabs.task_engine.client import Leash
+-from mqtt_listener import MqttListener
++# MODIFIED: Import from fixed MQTT listener
++from mqtt_listener_fixed import MqttListener
+ import argparse
+ import logging
+ import json
+@@ -111,8 +122,8 @@ if use_mock:
+ 
+         def load_data(self):
+             end_time_ms = int(time.time() * 1000)
+-            step_size_ms = 100 # 10Hz
+-            max_cached_values = 6000 # 10 minutes
++            step_size_ms = 100
++            max_cached_values = 6000
+             start_time_ms = end_time_ms - max_cached_values * step_size_ms
+             return [self._get_data_at_time(t) for t in range(start_time_ms, end_time_ms, step_size_ms)]
+ 
+@@ -123,7 +134,8 @@ if use_mock:
+ app = Flask(__name__, static_folder="build/static", template_folder="build")
+ app.config["SECRET_KEY"] = "secret!"
+ CORS(app, resources={r"/*": {"origins": "*"}})
+-socketio = SocketIO(app, cors_allowed_origins="*", max_http_buffer_size=20971520)
++# MODIFIED: Use async_mode='eventlet'
++socketio = SocketIO(app, cors_allowed_origins="*", max_http_buffer_size=20971520, async_mode='eventlet')
+ streaming = False
+ 
+ 
+@@ -152,7 +164,6 @@ def start_data_streaming():
+     streaming = True
+     data = provider.get_last_data()
+     if p is None:
+-        # delay connection to leash until we know the task engine is running
+         print("attempting to make leash connection")
+         p = Leash()
+         print("leash connected")
+@@ -184,7 +195,6 @@ def move_wiper(distance, velocity, acceleration):
+     print(velocity)
+     print(acceleration)
+     p.MCURelativeMove("X", float(distance), float(velocity), float(acceleration))
+-
+     print("wiper moving")
+     emit("wiper moving")
+ 
+@@ -194,11 +204,9 @@ def move_z(distance, velocity, acceleration):
+     print("z moving")
+     emit("z moving")
+     if float(distance) > 0:
+-        p.MCUSet(
+-            "Z", "Z_LIMIT_BEHAVIOR", 1
+-        )  # Stop the axis if Z Limit is hit while moving up
++        p.MCUSet("Z", "Z_LIMIT_BEHAVIOR", 1)
+     elif float(distance) < 0:
+-        p.MCUSet("Z", "Z_LIMIT_BEHAVIOR", 0)  # Ignore the liit switch if moving down
++        p.MCUSet("Z", "Z_LIMIT_BEHAVIOR", 0)
+     p.MCURelativeMove("Z", float(distance), float(velocity), float(acceleration))
+ 
+ 
+@@ -258,7 +266,6 @@ def run_tasks(f_code):
+ 
+ @socketio.on("dispense")
+ def dispense(dispense_duration_s):
+-    # TODO: make note of how these values were determined
+     p.DispenserOpenValves(0, 30)
+     print("duration:", dispense_duration_s)
+     socketio.sleep(int(dispense_duration_s))
+@@ -316,12 +323,18 @@ init_logging("debug_web_ui")
+ log = logging.getLogger("debug-web-ui")
+ 
+ if use_mock:
++    print("Using MockProvider for testing")
+     provider = MockProvider()
+ else:
+     try:
++        # MODIFIED: Use fixed MQTT listener
++        print("Initializing Fixed MqttListener with task/end data...")
+         provider = MqttListener()
++        print("MqttListener initialized successfully - subscribed to task/end")
+     except Exception as e:
+         log.fatal("Failed to start provider\n{}".format(e))
++        print("Falling back to MockProvider due to error:", e)
++        provider = MockProvider()
+ 
+ if __name__ == "__main__":
+     parser = argparse.ArgumentParser()
+diff --git a/mqtt_listener.py b/mqtt_listener.py
+index f5856cc..d8db2f5 100644
+--- a/mqtt_listener.py
++++ b/mqtt_listener.py
+@@ -1,9 +1,17 @@
+-# standard
++# MODIFICATIONS FROM ORIGINAL mqtt_listener.py:
++# 1. Changed subscription from "mcu/status" to "task/end"
++# 2. Added data filtering for MCUGetStatus tasks only
++# 3. Added underscore field names for charts compatibility
++# 4. Added automatic data flow trigger
++# 5. Fixed time format for charts (ISO string)
++# 6. Added safe type conversion for numeric values
++
+ import json
+ import threading
++import subprocess
++import time
++import datetime
+ from collections import deque
+-
+-# 3rd party
+ import paho.mqtt.client as mqtt
+ 
+ 
+@@ -25,13 +33,153 @@ class MqttListener:
+                                        protocol=mqtt.MQTTv5)
+         self.mqtt_client.connect(host, sub_port)
+         self.mqtt_client.on_message = self._on_message
+-        self.mqtt_client.subscribe("mcu/status", options=mqtt.SubscribeOptions(qos=1))
++        
++        # MODIFIED: Subscribe to task/end instead of mcu/status
++        self.mqtt_client.subscribe("task/end", options=mqtt.SubscribeOptions(qos=1))
++        print("MqttListener subscribed to: task/end")
+ 
+         self._running = True
+         threading.Thread(target=self._reader_thread, daemon=True).start()
++        
++        # NEW: Auto-start data flow trigger
++        self._start_data_flow()
++
++    def _format_mcu_data(self, mcu_info):
++        """Format MCU data to match web UI expected format"""
++        force_data = mcu_info.get('forceAndPositionReadings', {})
++        
++        # FIXED: Safely convert tUs to integer
++        try:
++            tUs = int(force_data.get('tUs', time.time() * 1000000))
++        except (ValueError, TypeError):
++            tUs = int(time.time() * 1000000)
++        
++        # FIXED: Convert timestamp to ISO string for charts
++        try:
++            dt = datetime.datetime.fromtimestamp(tUs / 1000000.0, tz=datetime.timezone.utc)
++            iso_time = dt.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + 'Z'
++        except:
++            iso_time = datetime.datetime.now(tz=datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + 'Z'
++        
++        # FIXED: Safely convert all numeric values
++        def safe_float(value, default=0):
++            try:
++                return float(value) if value is not None else default
++            except (ValueError, TypeError):
++                return default
++
++        # Main data structure (for tables)
++        formatted_data = {
++            "dispenseStatus": {
++                "leftCartridgeWeight": -102851,
++                "rightCartridgeWeight": 784,
++            },
++            "forceAndPositionReadings": {
++                "zForce": safe_float(force_data.get('zForce', 0)),
++                "zPosition": safe_float(force_data.get('zPosition', 0)),
++                "zForceTempMC": safe_float(force_data.get('zForceTempMC', 0)),
++                "zForceRawN": safe_float(force_data.get('zForceRawN', 0)),
++                "xPosition": safe_float(force_data.get('xPosition', 0)),
++                "tUs": tUs,
++                "xEnc": safe_float(force_data.get('xEnc', 0)),
++                "zAxisState": force_data.get('zAxisState', 'AXIS_STATE_IDLE'),
++                "xAxisState": force_data.get('xAxisState', 'AXIS_STATE_IDLE'),
++                "phase": force_data.get('phase', 'IDLE'),
++            },
++            "ledStatus": {
++                "dutyCycle": 100.0,
++                "LEDTemepratureMC": safe_float(force_data.get('zForceTempMC', 0)),
++                "currentMA": 3,
++                "voltageMV": 4,
++            },
++            "lcdStatus": {"dutyCycle": 100.0, "currentMA": 3, "voltageMV": 4},
++            "heaterStatus": mcu_info.get('heaterStatus', {
++                "cartridgeHeaterDutyCycle": 0.0,
++                "cartridgeHeaterCurrentMA": 0,
++                "cartridgeHeaterVoltageMV": 0,
++                "cartridgeTemperatureC": 25.0,
++            }),
++            "logList": {"logs": []},
++            "sanicStatus": mcu_info.get('sanicStatus', {
++                "timeSinceThisStateMCUMs": 289,
++                "timeSinceThisStateSanicMs": 50,
++                "distanceUm": 87605,
++                "temperatureMC": 21124,
++                "altTemperatureMC": 65535,
++                "ToFNs": 254909,
++                "ToFStdDevNs": 244,
++                "ToFSignalQuality": 12280,
++            }),
++            "IRReading": safe_float(force_data.get('zForceTempMC', 0)),
++            "thermistors": mcu_info.get('tempSensorsResinMC', [25000, 25100, 25200, 25300, 25400, 25500]),
++            "hang_weight_N": 50,
++            "time": iso_time,  # MODIFIED: ISO format for charts
++        }
++        
++        # NEW: Add underscore version for charts compatibility
++        formatted_data["force_and_position_readings"] = {
++            "zForce": safe_float(force_data.get('zForce', 0)),
++            "zPosition": safe_float(force_data.get('zPosition', 0)),
++            "zForceTempMC": safe_float(force_data.get('zForceTempMC', 0)),
++            "zForceRawN": safe_float(force_data.get('zForceRawN', 0)),
++            "xPosition": safe_float(force_data.get('xPosition', 0)),
++            "tUs": tUs,
++            "xEnc": safe_float(force_data.get('xEnc', 0)),
++            "zAxisState": force_data.get('zAxisState', 'AXIS_STATE_IDLE'),
++            "xAxisState": force_data.get('xAxisState', 'AXIS_STATE_IDLE'),
++            "phase": force_data.get('phase', 'IDLE'),
++        }
++        
++        # NEW: Add mcu_broadcast structure for charts
++        formatted_data["mcu_broadcast"] = {
++            "force_and_position_readings": formatted_data["force_and_position_readings"],
++            "thermistors_mC": formatted_data["thermistors"],
++            "IR_reading": formatted_data["IRReading"]
++        }
++        
++        return formatted_data
+ 
+     def _on_message(self, client, userdata, msg):
+-        self.data.append(json.loads(msg.payload))
++        try:
++            data = json.loads(msg.payload)
++            
++            # MODIFIED: Only process MCUGetStatus task results
++            if (msg.topic == "task/end" and 
++                data.get('task') == 'MCUGetStatus' and 
++                'return_value' in data and 
++                'info' in data['return_value']):
++                
++                mcu_info = data['return_value']['info']
++                formatted_data = self._format_mcu_data(mcu_info)
++                self.data.append(formatted_data)
++                
++                if len(self.data) % 10 == 0:
++                    print(f"Data point #{len(self.data)} - Z Force: {formatted_data['forceAndPositionReadings']['zForce']:.2f}N")
++                
++            elif len(self.data) % 50 == 0:
++                print(f"Received MQTT message on {msg.topic}: {data.get('task', 'unknown')}")
++                
++        except Exception as e:
++            print(f"MQTT message processing error: {e}")
++
++    def _start_data_flow(self):
++        """Start automatic data flow trigger"""
++        def data_trigger():
++            print("MCU data flow trigger started - 2Hz frequency")
++            count = 0
++            try:
++                while self._running:
++                    result = subprocess.run(['leash', 'MCUGetStatus()'], 
++                                          capture_output=True, text=True)
++                    count += 1
++                    if count % 20 == 0:
++                        print(f"Triggered {count} MCU data updates")
++                    time.sleep(0.5)
++            except Exception as e:
++                print(f"Data flow trigger error: {e}")
++        
++        threading.Thread(target=data_trigger, daemon=True).start()
++        print("MCU data flow trigger started")
+ 
+     @property
+     def closed(self):
